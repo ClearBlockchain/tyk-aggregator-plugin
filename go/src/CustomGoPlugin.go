@@ -1,19 +1,36 @@
 package main
 
 import (
-	"net/http"
-
+	"bytes"
+	"encoding/json"
 	"github.com/TykTechnologies/opentelemetry/trace"
 	"github.com/TykTechnologies/tyk/ctx"
-
 	"github.com/TykTechnologies/tyk/log"
-	"github.com/TykTechnologies/tyk/user"
+	"io"
+	"net/http"
+	"time"
 )
+
+const (
+	reportInterval = 30 * time.Second // how often to report agg usages
+)
+
+type Resource struct {
+	OrderId            string
+	ProductId          string
+	ConsumerId         string
+	ResourceInstanceId string
+	Period             map[string]string
+	Products           []map[string]interface{}
+}
+
+var usageReports chan *Resource
 
 var logger = log.Get()
 
 // AddFooBarHeader adds custom "Foo: Bar" header to the request
 func AddFooBarHeader(rw http.ResponseWriter, r *http.Request) {
+	apidef := ctx.GetDefinition(r)
 	// We create a new span using the context from the incoming request.
 	_, newSpan := trace.NewSpanFromContext(r.Context(), "", "GoPlugin_first-span")
 
@@ -26,43 +43,87 @@ func AddFooBarHeader(rw http.ResponseWriter, r *http.Request) {
 	// Set the status of the span.
 	newSpan.SetStatus(trace.SPAN_STATUS_OK, "")
 
-	r.Header.Add("Foo", "Bar")
-}
+	r.Header.Add("Foo", "Bar2")
 
-// Custom Auth, applies a rate limit of
-// 2 per 10 given a token of "abc"
-func AuthCheck(rw http.ResponseWriter, r *http.Request) {
-	token := r.Header.Get("Authorization")
+	logger.Info("AddFooBarHeader called for API: ", apidef.Name)
 
-	_, newSpan := trace.NewSpanFromContext(r.Context(), "", "GoPlugin_custom-auth")
-	defer newSpan.End()
-
-	if token != "d3fd1a57-94ce-4a36-9dfe-679a8f493b49" && token != "3be61aa4-2490-4637-93b9-105001aa88a5" {
-		newSpan.SetAttributes(trace.NewAttribute("auth", "failed"))
-		newSpan.SetStatus(trace.SPAN_STATUS_ERROR, "")
-
-		rw.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	newSpan.SetAttributes(trace.NewAttribute("auth", "success"))
-	newSpan.SetStatus(trace.SPAN_STATUS_OK, "")
-
-	session := &user.SessionState{
-		Alias: token,
-		Rate:  2,
-		Per:   10,
-		MetaData: map[string]interface{}{
-			token: token,
+	usageReports <- &Resource{
+		OrderId:            "orderId",
+		ProductId:          "productId",
+		ConsumerId:         "consumerId",
+		ResourceInstanceId: "resourceInstanceId",
+		Period: map[string]string{
+			"start": time.Now().UTC().Format(time.RFC3339),
+			"end":   time.Now().UTC().Format(time.RFC3339),
 		},
-		KeyID: token,
+		Products: []map[string]interface{}{
+			{
+				"type":            "FIVE_G",
+				"reportedValue":   1,
+				"ownerId":         "112c7aa6-eccd-4eff-a06c-f1de2ee79225",
+				"measurementType": "REQUEST",
+			},
+		},
 	}
-
-	ctx.SetSession(r, session, true)
 }
 
 func main() {}
 
 func init() {
-	logger.Info("--- Go custom plugin v4 init success! ---- ")
+	logger.Info("--- ClearX aggregator middleware init success! ---- ")
+	usageReports = make(chan *Resource)
+	go reportsAggregator(reportInterval)
+}
+
+func reportsAggregator(updateInterval time.Duration) {
+	aggregateUsages := make([]*Resource, 0)
+	ticker := time.NewTicker(updateInterval)
+	for {
+		select {
+		case <-ticker.C:
+			logger.Info("Reporting usage, aggregate length - ", len(aggregateUsages))
+			// report usage and clear usageReports
+			for _, r := range aggregateUsages {
+				logger.Info("Reporting usage ", r)
+				reportUsageToCAL(r)
+			}
+			aggregateUsages = make([]*Resource, 0)
+		case r := <-usageReports:
+			logger.Info("Received usage report ", r)
+			aggregateUsages = append(aggregateUsages, r)
+			// do something with new usage (maybe agg by order ?)
+		}
+	}
+}
+
+func reportUsageToCAL(r *Resource) {
+	jsonData, err := json.Marshal(r)
+
+	if err != nil {
+		logger.Error(err)
+		return
+	}
+	resp, err := http.Post("https://httpbin.org/post", "application/json", bytes.NewBuffer(jsonData))
+
+	if err != nil {
+		logger.Error(err)
+		return
+	}
+
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			logger.Error(err)
+		}
+	}(resp.Body)
+
+	var res map[string]interface{}
+
+	err = json.NewDecoder(resp.Body).Decode(&res)
+	if err != nil {
+		logger.Error(err)
+		return
+	}
+
+	logger.Info("res - ", res["json"])
 }
