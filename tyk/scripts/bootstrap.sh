@@ -48,7 +48,7 @@ if [ "302" == "$status" ] || [ "200" == "$status" ]; then
         \"custom_middleware\": {
           \"pre\": [
             {
-              \"name\": \"AddFooBarHeader\",
+              \"name\": \"AggregatorMiddleware\",
               \"path\": \"/opt/tyk-gateway/middleware/CustomGoPlugin.so\",
               \"require_session\": false,
               \"raw_body_only\": false
