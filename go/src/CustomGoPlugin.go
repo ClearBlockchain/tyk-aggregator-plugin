@@ -24,7 +24,7 @@ const (
 	reportInterval = 30 * time.Second // how often to report agg usages
 )
 
-type Resource struct {
+type UsageReport struct {
 	OrderId            string
 	ProductId          string
 	ConsumerId         string
@@ -33,9 +33,15 @@ type Resource struct {
 	Products           []map[string]interface{}
 }
 
-var usageReports chan *Resource
-
+var usageReports chan *UsageReport
+var aggregateUsages []*UsageReport
 var logger = log.Get()
+
+var redisClient = redis.NewClient(&redis.Options{
+	Addr:     "10.10.8.21:30379",
+	Password: "DimAJnkE3R", // no password set
+	DB:       0,            // use default database
+})
 
 func copyHeaders(src, dst *http.Request) {
 	for k, vv := range src.Header {
@@ -143,7 +149,7 @@ func AggregatorMiddleware(rw http.ResponseWriter, r *http.Request) {
 
 	logger.Info("AggregatorMiddleware called for API: ", apidef.Name)
 
-	usageReports <- &Resource{
+	usageReports <- &UsageReport{
 		OrderId:            "orderId",
 		ProductId:          "productId",
 		ConsumerId:         "consumerId",
@@ -273,11 +279,6 @@ func getForwardInfo(r *http.Request, apiDef *apidef.APIDefinition) (string, map[
 }
 
 func getTokenFromRedis(userId string, myClientId string, forwardToIdentity string) (string, error) {
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:     "10.10.8.21:30379",
-		Password: "DimAJnkE3R", // no password set
-		DB:       0,            // use default database
-	})
 	redisKey := userId + ":" + myClientId + ":" + forwardToIdentity
 	ctx := context.Background()
 	redisToken, err := redisClient.Get(ctx, redisKey).Result()
@@ -324,49 +325,92 @@ func main() {}
 
 func init() {
 	logger.Info("--- ClearX aggregator middleware init success! ---- ")
-	usageReports = make(chan *Resource)
+	usageReports = make(chan *UsageReport)
+	aggregateUsages = make([]*UsageReport, 0)
 	go reportsAggregator(reportInterval)
+
+	reloadUnReportedUsage()
+}
+
+func reloadUnReportedUsage() {
+	ctx2 := context.Background()
+	iter := redisClient.Scan(ctx2, 0, "usageReport:*", 0).Iterator()
+	for iter.Next(ctx2) {
+		fmt.Println("keys", iter.Val())
+		val, err := redisClient.Get(ctx2, iter.Val()).Result()
+		if err != nil {
+			logger.Error("Error getting key from redis ", err)
+			continue
+		}
+		fmt.Println("val", val)
+		var usage UsageReport
+		err = json.Unmarshal([]byte(val), &usage)
+		if err != nil {
+			logger.Error("Error unmarshalling json ", err)
+			continue
+		}
+		fmt.Println("usage", usage)
+		aggregateUsages = append(aggregateUsages, &usage)
+	}
+	if err := iter.Err(); err != nil {
+		panic(err)
+	}
 }
 
 func reportsAggregator(updateInterval time.Duration) {
-	aggregateUsages := make([]*Resource, 0)
 	ticker := time.NewTicker(updateInterval)
 	for {
 		select {
 		case <-ticker.C:
 			logger.Info("Reporting usage, aggregate length - ", len(aggregateUsages))
 			// report usage and clear usageReports
-			for _, r := range aggregateUsages {
+			for i := len(aggregateUsages) - 1; i >= 0; i-- {
+				r := aggregateUsages[i]
 				logger.Info("Reporting usage ", r)
-				reportUsageToCAL(r)
+				err := reportUsageToCAL(r)
+				if err != nil {
+					logger.Error("Error reporting usage ", err)
+					continue
+				}
+				// Swap the current element with the last element
+				aggregateUsages[i] = aggregateUsages[len(aggregateUsages)-1]
+				// Reduce the slice by one, effectively removing the last element
+				aggregateUsages = aggregateUsages[:len(aggregateUsages)-1]
+				// delete key from redis
+				usageRedisKey := "usageReport:" + r.OrderId + r.Period["start"]
+				redisClient.Del(context.Background(), usageRedisKey)
 			}
-			aggregateUsages = make([]*Resource, 0)
 		case r := <-usageReports:
 			logger.Info("Received usage report ", r)
 			aggregateUsages = append(aggregateUsages, r)
+			bytes, _ := json.Marshal(r)
+			usageStr := string(bytes)
+			usageRedisKey := "usageReport:" + r.OrderId + r.Period["start"]
+			redisClient.Set(context.Background(), usageRedisKey, usageStr, 0)
+
 			// do something with new usage (maybe agg by order ?)
 		}
 	}
 }
 
-func reportUsageToCAL(r *Resource) {
+func reportUsageToCAL(r *UsageReport) error {
 	jsonData, err := json.Marshal(r)
 
 	if err != nil {
-		logger.Error(err)
-		return
+		logger.Error("Error marshalling json data" + err.Error())
+		return err
 	}
 	resp, err := http.Post("https://httpbin.org/post", "application/json", bytes.NewBuffer(jsonData))
 
 	if err != nil {
-		logger.Error(err)
-		return
+		logger.Error("Error posting json data" + err.Error())
+		return err
 	}
 
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
 		if err != nil {
-			logger.Error(err)
+			logger.Error("Error closing body" + err.Error())
 		}
 	}(resp.Body)
 
@@ -374,9 +418,10 @@ func reportUsageToCAL(r *Resource) {
 
 	err = json.NewDecoder(resp.Body).Decode(&res)
 	if err != nil {
-		logger.Error(err)
-		return
+		logger.Error("Error decoding json data" + err.Error())
+		return err
 	}
 
 	logger.Info("res - ", res["json"])
+	return nil
 }
