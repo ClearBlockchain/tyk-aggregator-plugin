@@ -14,7 +14,6 @@ import (
 	"github.com/go-redis/redis/v8"
 	"golang.org/x/oauth2/clientcredentials"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"time"
@@ -53,7 +52,7 @@ func copyHeaders(src, dst *http.Request) {
 
 // AggregatorMiddleware is a middleware that will be called for every request
 func AggregatorMiddleware(rw http.ResponseWriter, r *http.Request) {
-	apidef := ctx.GetDefinition(r)
+	apiDefinition := ctx.GetDefinition(r)
 	// We create a new span using the context from the incoming request.
 	_, newSpan := trace.NewSpanFromContext(r.Context(), "", "GoPlugin_first-span")
 
@@ -68,17 +67,22 @@ func AggregatorMiddleware(rw http.ResponseWriter, r *http.Request) {
 
 	// start logic
 
-	fmt.Println("inside AggregatorMiddleware")
+	logger.Info("inside AggregatorMiddleware")
 	apiDef := ctx.GetDefinition(r)
 
 	forwardToIdentity, forwardToInfo, url, authType, err := getForwardInfo(r, apiDef)
 	if err != nil {
+		logger.Error("Error getting forward info ", err)
 		rw.WriteHeader(http.StatusInternalServerError)
-		rw.Write([]byte("Error:  " + err.Error()))
+		_, err := rw.Write([]byte("Error:  " + err.Error()))
+		if err != nil {
+			logger.Error(err)
+			return
+		}
 		return
 	}
 
-	fmt.Println("URL:", url+r.URL.Path, authType)
+	logger.Info("URL:", url+r.URL.Path, authType)
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
 		if err != nil {
@@ -101,35 +105,52 @@ func AggregatorMiddleware(rw http.ResponseWriter, r *http.Request) {
 	var client *http.Client
 	req, err := http.NewRequest(r.Method, url, bytes.NewBuffer([]byte(res["body"].(string))))
 	if err != nil {
-		fmt.Println("Error creating request:", err)
+		logger.Error("Error creating request:", err)
 		rw.WriteHeader(http.StatusInternalServerError)
-		rw.Write([]byte("Error: creating request"))
+		_, err := rw.Write([]byte("Error: creating request"))
+		if err != nil {
+			logger.Error(err)
+			return
+		}
 		return
 	}
 	copyHeaders(r, req)
 
 	client, err = configureAuthClient(r, authType, forwardToIdentity, forwardToInfo, client, req)
 	if err != nil {
-		fmt.Println("Error configuring client:", err)
+		logger.Error("Error configuring client:", err)
 		rw.WriteHeader(http.StatusUnauthorized)
-		rw.Write([]byte("Error " + err.Error()))
+		_, err := rw.Write([]byte("Error " + err.Error()))
+		if err != nil {
+			logger.Error(err)
+			return
+		}
 		return
 	}
 
 	// Send the request
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("PROXY request error:", err)
+		logger.Error("PROXY request error:", err)
 
 		rw.WriteHeader(http.StatusInternalServerError)
-		rw.Write([]byte("PROXY request error"))
+		_, err := rw.Write([]byte("PROXY request error"))
+		if err != nil {
+			logger.Error(err)
+			return
+		}
 
 		return
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			logger.Error(err)
+		}
+	}(resp.Body)
 
 	// Saving GET result and extracting data
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		responseBody = "Error reading base response body: " + err.Error()
 		responseStatusCode = http.StatusInternalServerError
@@ -137,17 +158,21 @@ func AggregatorMiddleware(rw http.ResponseWriter, r *http.Request) {
 		responseBody = string(body)
 		responseStatusCode = resp.StatusCode
 	}
-	fmt.Println("Response body:", string(body)) // Print the entire response body
+	logger.Info("Response body:", string(body)) // Print the entire response body
 
 	// return response to user asap
 	rw.WriteHeader(responseStatusCode)
-	rw.Write([]byte(responseBody))
+	_, err = rw.Write([]byte(responseBody))
+	if err != nil {
+		logger.Error(err)
+		return
+	}
 	// return without report usage if got an error
 	if responseStatusCode == http.StatusInternalServerError {
 		return
 	}
 
-	logger.Info("AggregatorMiddleware called for API: ", apidef.Name)
+	logger.Info("AggregatorMiddleware called for API: ", apiDefinition.Name)
 
 	usageReports <- &UsageReport{
 		OrderId:            "orderId",
@@ -174,13 +199,13 @@ func configureAuthClient(r *http.Request, authType string, forwardToIdentity str
 		// here check if I already have a token save in redis to talk to operator and if not get token now
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			fmt.Println("Error: Authorization header is missing so no token.")
+			logger.Info("Error: Authorization header is missing so no token.")
 			return nil, errors.New("authorization header is missing")
 
 		}
 		reqTokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 		if reqTokenStr == "" {
-			fmt.Println("Error: Req Bearer token is missing")
+			logger.Info("Error: Req Bearer token is missing")
 			return nil, errors.New("req bearer token is missing")
 		}
 
@@ -191,7 +216,7 @@ func configureAuthClient(r *http.Request, authType string, forwardToIdentity str
 		}
 		alreadyExistsToken, err := getTokenFromRedis(userId, aggClientId, forwardToIdentity)
 		if err != nil {
-			fmt.Println("Error getting token from Redis so asking for new token. error:", err)
+			logger.Info("Error getting token from Redis so asking for new token. error:", err)
 			clientID := forwardToInfo["clientId"].(string)
 			clientSecret := forwardToInfo["clientSecret"].(string)
 			tokenURL := forwardToInfo["getTokenUrl"].(string)
@@ -206,14 +231,14 @@ func configureAuthClient(r *http.Request, authType string, forwardToIdentity str
 
 			// http.Client will automatically handle token refreshing
 			client = conf.Client(context.Background())
-			fmt.Println("my client")
-			fmt.Println(client)
+			logger.Info("my client")
+			logger.Info(client)
 		} else {
 			// Add the "Authorization" header with the "Bearer" token
 			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", alreadyExistsToken))
 			// Create a new HTTP client
 			client = &http.Client{}
-			// should I add the clienID also ?
+			// should I add the clientID also ?
 		}
 
 	} else if authType == "base" {
@@ -227,7 +252,7 @@ func configureAuthClient(r *http.Request, authType string, forwardToIdentity str
 		// Create a new HTTP client
 		client = &http.Client{}
 
-		//TOOD: send response back to user
+		// TODO: send response back to user
 	} else if authType == "keyless" {
 		client = &http.Client{}
 
@@ -241,7 +266,7 @@ func configureAuthClient(r *http.Request, authType string, forwardToIdentity str
 func getForwardInfo(r *http.Request, apiDef *apidef.APIDefinition) (string, map[string]interface{}, string, string, error) {
 	forwardOptions, ok := apiDef.ConfigData["forwardOptions"].(map[string]interface{})
 	if !ok {
-		fmt.Println("Error: forwardOptions is not a map")
+		logger.Error("Error: forwardOptions is not a map")
 		return "", nil, "", "", errors.New("forwardOptions is not a map")
 	}
 
@@ -249,30 +274,30 @@ func getForwardInfo(r *http.Request, apiDef *apidef.APIDefinition) (string, map[
 	forwardToIdentity := r.Header.Get("network")
 	if forwardToIdentity == "" {
 		// Handle case where header is missing or value is empty
-		fmt.Println("Error: Missing header: network")
+		logger.Error("Error: Missing header: network")
 		return "", nil, "", "", errors.New("missing header: network")
 	}
 
 	forwardToInfoRes, exists := forwardOptions[forwardToIdentity]
 	if !exists {
-		fmt.Println("Error: Key does not exist")
+		logger.Error("Error: Key does not exist")
 		return "", nil, "", "", errors.New("key does not exist")
 	}
 
 	forwardToInfo, ok := forwardToInfoRes.(map[string]interface{})
 	if !ok {
-		fmt.Println("Error: option is not a map")
+		logger.Info("Error: option is not a map")
 		return "", nil, "", "", errors.New("option is not a map")
 	}
 
 	url, exists := forwardToInfo["url"].(string)
 	if !exists {
-		fmt.Println("Error: url does not exist")
+		logger.Info("Error: url does not exist")
 		return "", nil, "", "", errors.New("url does not exist")
 	}
 	authType, exists := forwardToInfo["authType"].(string)
 	if !exists {
-		fmt.Println("Error: authType does not exist")
+		logger.Info("Error: authType does not exist")
 		return "", nil, "", "", errors.New("authType does not exist")
 	}
 	return forwardToIdentity, forwardToInfo, url, authType, nil
@@ -280,8 +305,8 @@ func getForwardInfo(r *http.Request, apiDef *apidef.APIDefinition) (string, map[
 
 func getTokenFromRedis(userId string, myClientId string, forwardToIdentity string) (string, error) {
 	redisKey := userId + ":" + myClientId + ":" + forwardToIdentity
-	ctx := context.Background()
-	redisToken, err := redisClient.Get(ctx, redisKey).Result()
+	ctx2 := context.Background()
+	redisToken, err := redisClient.Get(ctx2, redisKey).Result()
 	if err != nil {
 		return "", fmt.Errorf("cannot find redisData so guessing no token is available for key %s: %w", redisKey, err)
 	}
@@ -305,7 +330,7 @@ func getSubFromToken(tokenStr string) (string, string, error) {
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return "", "", fmt.Errorf("error unmarshaling token payload: %w", err)
 	}
-	fmt.Println("payload", claims["client_id"].(string))
+	logger.Info("payload", claims["client_id"].(string))
 
 	// Extract the 'sub' field from the map
 	sub, ok := claims["sub"].(string)
@@ -336,24 +361,24 @@ func reloadUnReportedUsage() {
 	ctx2 := context.Background()
 	iter := redisClient.Scan(ctx2, 0, "usageReport:*", 0).Iterator()
 	for iter.Next(ctx2) {
-		fmt.Println("keys", iter.Val())
+		logger.Info("keys", iter.Val())
 		val, err := redisClient.Get(ctx2, iter.Val()).Result()
 		if err != nil {
 			logger.Error("Error getting key from redis ", err)
 			continue
 		}
-		fmt.Println("val", val)
+		logger.Info("val", val)
 		var usage UsageReport
 		err = json.Unmarshal([]byte(val), &usage)
 		if err != nil {
 			logger.Error("Error unmarshalling json ", err)
 			continue
 		}
-		fmt.Println("usage", usage)
+		logger.Info("usage", usage)
 		aggregateUsages = append(aggregateUsages, &usage)
 	}
 	if err := iter.Err(); err != nil {
-		panic(err)
+		logger.Error("Error iterating over redis keys ", err)
 	}
 }
 
@@ -383,8 +408,8 @@ func reportsAggregator(updateInterval time.Duration) {
 		case r := <-usageReports:
 			logger.Info("Received usage report ", r)
 			aggregateUsages = append(aggregateUsages, r)
-			bytes, _ := json.Marshal(r)
-			usageStr := string(bytes)
+			marshal, _ := json.Marshal(r)
+			usageStr := string(marshal)
 			usageRedisKey := "usageReport:" + r.OrderId + r.Period["start"]
 			redisClient.Set(context.Background(), usageRedisKey, usageStr, 0)
 
